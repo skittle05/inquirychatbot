@@ -1,0 +1,210 @@
+<?php
+require_once 'ai_config.php';
+require_once 'connection.php';
+
+class AIHandler
+{
+    private $db;
+    private $apiKey;
+    private const MAX_QUERY_LENGTH = 4096; // Maximum query length
+    private const MIN_QUERY_LENGTH = 2;    // Minimum query length
+    private const MAX_RETRIES = 3;         // Maximum API call retries
+
+    public function __construct()
+    {
+        global $conn;
+        if (!$conn) {
+            throw new Exception("Database connection failed");
+        }
+        $this->db = $conn;
+        $this->apiKey = $this->getApiKey();
+    }
+
+    private function getApiKey()
+    {
+        if (!defined('OPENAI_API_KEY') || empty(OPENAI_API_KEY)) {
+            throw new Exception(ERROR_API_KEY_MISSING);
+        }
+        return OPENAI_API_KEY;
+    }
+
+    public function processQuery($query, $userId)
+    {
+        // Validate inputs
+        $this->validateInputs($query, $userId);
+
+        // Sanitize the query
+        $query = $this->sanitizeInput($query);
+
+        try {
+            $response = $this->callOpenAIWithRetry($query);
+            $this->saveQuery($userId, $query, $response);
+            return $response;
+        } catch (Exception $e) {
+            error_log("AI Error: " . $e->getMessage());
+            throw new Exception(ERROR_API_REQUEST);
+        }
+    }
+
+    private function validateInputs($query, $userId)
+    {
+        if (empty($query)) {
+            throw new Exception(ERROR_INVALID_REQUEST);
+        }
+
+        if (strlen($query) > self::MAX_QUERY_LENGTH) {
+            throw new Exception("Query too long. Maximum length is " . self::MAX_QUERY_LENGTH . " characters.");
+        }
+
+        if (strlen($query) < self::MIN_QUERY_LENGTH) {
+            throw new Exception("Query too short. Minimum length is " . self::MIN_QUERY_LENGTH . " characters.");
+        }
+
+        if (!is_numeric($userId) || $userId <= 0) {
+            throw new Exception("Invalid user ID");
+        }
+    }
+
+    private function sanitizeInput($input)
+    {
+        // Remove any null bytes
+        $input = str_replace(chr(0), '', $input);
+        
+        // Remove any non-printable characters except normal spaces and line breaks
+        $input = preg_replace('/[^\P{C}\n\r\t ]/u', '', $input);
+        
+        // Trim whitespace
+        return trim($input);
+    }
+
+    private function callOpenAIWithRetry($query)
+    {
+        $attempts = 0;
+        $lastError = null;
+
+        while ($attempts < self::MAX_RETRIES) {
+            try {
+                return $this->callOpenAI($query);
+            } catch (Exception $e) {
+                $lastError = $e;
+                $attempts++;
+                if ($attempts < self::MAX_RETRIES) {
+                    // Exponential backoff
+                    sleep(pow(2, $attempts));
+                }
+            }
+        }
+
+        throw $lastError;
+    }
+
+    private function callOpenAI($query)
+    {
+        $curl = curl_init();
+        
+        $data = [
+            'model' => AI_MODEL,
+            'messages' => [
+                ['role' => 'user', 'content' => $query]
+            ],
+            'max_tokens' => MAX_TOKENS,
+            'temperature' => TEMPERATURE
+        ];
+
+        curl_setopt_array($curl, [
+            CURLOPT_URL => 'https://api.openai.com/v1/chat/completions',
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_ENCODING => '',
+            CURLOPT_MAXREDIRS => 10,
+            CURLOPT_TIMEOUT => 30,
+            CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_1_1,
+            CURLOPT_CUSTOMREQUEST => 'POST',
+            CURLOPT_POSTFIELDS => json_encode($data),
+            CURLOPT_HTTPHEADER => [
+                'Content-Type: application/json',
+                'Authorization: Bearer ' . $this->apiKey
+            ],
+            CURLOPT_SSL_VERIFYPEER => true,  // Enable SSL verification
+            CURLOPT_SSL_VERIFYHOST => 2,      // Verify SSL host
+        ]);
+
+        $response = curl_exec($curl);
+        $httpCode = curl_getinfo($curl, CURLINFO_HTTP_CODE);
+        $err = curl_error($curl);
+        curl_close($curl);
+
+        if ($err) {
+            throw new Exception("cURL Error: " . $err);
+        }
+
+        if ($httpCode !== 200) {
+            throw new Exception("API Error: HTTP code " . $httpCode);
+        }
+
+        $responseData = json_decode($response, true);
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            throw new Exception("Invalid JSON response from API");
+        }
+
+        if (isset($responseData['error'])) {
+            throw new Exception("API Error: " . $responseData['error']['message']);
+        }
+
+        if (!isset($responseData['choices'][0]['message']['content'])) {
+            throw new Exception("Invalid response format from API");
+        }
+
+        return $responseData['choices'][0]['message']['content'];
+    }
+
+    private function saveQuery($userId, $query, $response)
+    {
+        try {
+            $stmt = $this->db->prepare("INSERT INTO ai_queries (user_id, query, response, created_at) VALUES (?, ?, ?, NOW())");
+            if (!$stmt) {
+                throw new Exception("Failed to prepare statement: " . $this->db->error);
+            }
+
+            $stmt->bind_param("iss", $userId, $query, $response);
+            if (!$stmt->execute()) {
+                throw new Exception("Failed to execute statement: " . $stmt->error);
+            }
+            $stmt->close();
+        } catch (Exception $e) {
+            error_log("Database Error: " . $e->getMessage());
+            throw new Exception("Failed to save query history");
+        }
+    }
+
+    public function getQueryHistory($userId, $limit = 10)
+    {
+        try {
+            // Validate inputs
+            if (!is_numeric($userId) || $userId <= 0) {
+                throw new Exception("Invalid user ID");
+            }
+            $limit = min(max((int)$limit, 1), 50); // Limit between 1 and 50
+
+            $stmt = $this->db->prepare("SELECT query, response, created_at FROM ai_queries WHERE user_id = ? ORDER BY created_at DESC LIMIT ?");
+            if (!$stmt) {
+                throw new Exception("Failed to prepare statement: " . $this->db->error);
+            }
+
+            $stmt->bind_param("ii", $userId, $limit);
+            if (!$stmt->execute()) {
+                throw new Exception("Failed to execute statement: " . $stmt->error);
+            }
+
+            $result = $stmt->get_result();
+            $history = [];
+            while ($row = $result->fetch_assoc()) {
+                $history[] = $row;
+            }
+            $stmt->close();
+            return $history;
+        } catch (Exception $e) {
+            error_log("Database Error: " . $e->getMessage());
+            throw new Exception("Failed to retrieve query history");
+        }
+    }
+}

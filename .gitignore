@@ -1,0 +1,12 @@
+# Ignore configuration files
+config.php
+
+# Ignore vendor directories
+vendor/
+
+# Ignore log files
+*.log
+error.log
+
+# Ignore user-uploaded files
+uploads/ 
